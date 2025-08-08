@@ -78,9 +78,9 @@ cmsearch -h
 
 ### NCBI BLAST+
 *   **Linux/macOS (via Conda):**
-	```bash
-	conda install -c bioconda blast
-	```
+```bash
+conda install -c bioconda blast
+```
 *   **Manual Installation:** Download from the [NCBI FTP site](https://ftp.ncbi.nlm.nih.gov/blast/executables/blast+/LATEST/).
 
 Ensure `blastp` and `tblastn` are accessible:
@@ -107,54 +107,54 @@ You need a curated set of known selenoproteins. **Crucially, ensure Selenocystei
 ### 3. Update Paths in the Script
 Open the Julia script and modify the configuration section:
 
-	```julia
-	# ----------------------------------------------------------------------------
-	# Configuration: Paths to external tools and resources
-	# ----------------------------------------------------------------------------
+```julia
+# ----------------------------------------------------------------------------
+# Configuration: Paths to external tools and resources
+# ----------------------------------------------------------------------------
+
+# If installed in PATH, these defaults should work:
+const CMSEARCH_EXEC = "cmsearch"
+const BLASTP_EXEC = "blastp"
+const TBLASTN_EXEC = "tblastn"
 	
-	# If installed in PATH, these defaults should work:
-	const CMSEARCH_EXEC = "cmsearch"
-	const BLASTP_EXEC = "blastp"
-	const TBLASTN_EXEC = "tblastn"
+# Configuration paths (YOU MUST UPDATE THESE PATHS)
+const SECIS_CM_FILE = "/path/to/Eukaryotic_SECIS.cm"
 	
-	# Configuration paths (YOU MUST UPDATE THESE PATHS)
-	const SECIS_CM_FILE = "/path/to/Eukaryotic_SECIS.cm"
+# Known selenoproteins (FASTA format for TBLASTN query)
+const SELENOPROTEIN_FASTA = "/path/to/selenoproteins.fasta"
 	
-	# Known selenoproteins (FASTA format for TBLASTN query)
-	const SELENOPROTEIN_FASTA = "/path/to/selenoproteins.fasta"
+# Formatted BLAST DB for BLASTP confirmation
+const SELENOPROTEIN_BLAST_DB = "/path/to/selenodb_blast_db"
 	
-	# Formatted BLAST DB for BLASTP confirmation
-	const SELENOPROTEIN_BLAST_DB = "/path/to/selenodb_blast_db"
-	
-	# Parameters
-	const MAX_3UTR_SEARCH = 2000 
-	const TBLASTN_EVALUE_CUTOFF = 1e-5
-	const CMSEARCH_EVALUE_CUTOFF = 0.01
-    const CPU_CORES = 4 # Adjust based on available resources
-	```
+# Parameters
+const MAX_3UTR_SEARCH = 2000 
+const TBLASTN_EVALUE_CUTOFF = 1e-5
+const CMSEARCH_EVALUE_CUTOFF = 0.01
+const CPU_CORES = 4 # Adjust based on available resources
+```
 
 ## Usage
 The pipeline requires the target organism's genome sequence (FASTA) and optionally the gene annotations (GFF3).
 
-	1.  **Genome Sequence:** A FASTA file (`.fna`, `.fasta`).
-	2.  **Gene Annotations (Optional):** A GFF3 file (`.gff`, `.gff3`).
+1.  **Genome Sequence:** A FASTA file (`.fna`, `.fasta`).
+2.  **Gene Annotations (Optional):** A GFF3 file (`.gff`, `.gff3`).
 
 Load the script into the Julia REPL and execute it:
 
-	```julia
-	# Load the script
-	include("pipeline.jl")
+```julia
+# Load the script
+include("pipeline.jl")
 	
-	genome_file = "/path/to/your_genome.fna"
-	annotation_file = "/path/to/your_annotations.gff3"
+genome_file = "/path/to/your_genome.fna"
+annotation_file = "/path/to/your_annotations.gff3"
 	
-	# Run comprehensive pipeline (Annotation + Homology)
-	# If annotation_file path is invalid or empty, it will skip the annotation-based search.
-	run_pipeline(genome_file, annotation_file)
+# Run comprehensive pipeline (Annotation + Homology)
+# If annotation_file path is invalid or empty, it will skip the annotation-based search.
+run_pipeline(genome_file, annotation_file)
 	
-	# Run only de novo pipeline (Homology only)
-	# run_pipeline(genome_file)
-	```
+# Run only de novo pipeline (Homology only)
+# run_pipeline(genome_file)
+```
 
 ## Limitations
 *   **Manual Verification is Essential:** This pipeline identifies high-confidence candidates, but manual inspection of the alignments (both TBLASTN U-* alignments and BLASTP U-U/C alignments) is mandatory for final confirmation.
