@@ -57,14 +57,8 @@ function check_executables(config::PipelineConfig)
     execs = [config.cmsearch_exec, config.blastp_exec, config.tblastn_exec]
     all_found = true
     for exec in execs
-        try
-            # Use `which` to find the executable
-            if Sys.which(exec) === nothing
-                @error "Executable not found in PATH: $exec"
-                all_found = false
-            end
-        catch
-            @error "Error checking for executable: $exec"
+        if Sys.which(exec) === nothing
+            @error "Executable not found in PATH: $exec"
             all_found = false
         end
     end
@@ -116,18 +110,13 @@ function reconstruct_cds_from_gff3(gff3_file::String, genome::Dict{String, LongD
     # Temporary storage for CDS fragments grouped by parent ID
     cds_fragments = Dict{String, Vector{GFF3.Record}}()
 
-    # 1. Collect and group CDS features
+    # 1. Collect and group CDS features by Parent ID
     for feature in reader
         if GFF3.featuretype(feature) == "CDS"
-            # Identify the parent transcript/mRNA
             parents = GFF3.attributes(feature, "Parent")
-            if isempty(parents)
-                # Skip CDS features without clear parentage in this implementation
-                continue
-            else
-                parent_id = parents[1]
-            end
-
+            if isempty(parents) continue end
+            
+            parent_id = parents[1]
             if !haskey(cds_fragments, parent_id)
                 cds_fragments[parent_id] = []
             end
@@ -139,35 +128,20 @@ function reconstruct_cds_from_gff3(gff3_file::String, genome::Dict{String, LongD
     # 2. Reconstruct sequences
     for (transcript_id, fragments) in cds_fragments
         if isempty(fragments) continue end
-
-        # Check consistency
         record_id = GFF3.seqid(fragments[1])
         strand = GFF3.strand(fragments[1])
 
-        if !haskey(genome, record_id)
-            @warn "Record ID $record_id found in GFF3 but not in Genome FASTA. Skipping $transcript_id."
-            continue
-        end
+        if !haskey(genome, record_id) || !(strand in ['+', '-']) continue end
 
         # Sort fragments based on biological order (5' -> 3')
-        if strand == '+'
-            sort!(fragments, by=GFF3.seqstart)
-        elseif strand == '-'
-            # For reverse strand, the biological start is the highest coordinate
-             sort!(fragments, by=GFF3.seqstart, rev=true)
-        else
-            # Skip unstranded features
-            continue
-        end
+        sort!(fragments, by=GFF3.seqstart, rev=(strand == '-'))
 
         # Concatenate sequences
         full_cds = LongDNA{4}("")
+        valid = true
         for frag in fragments
-            # Basic validation during reconstruction
             if GFF3.seqid(frag) != record_id || GFF3.strand(frag) != strand
-                @warn "Inconsistent strand or record ID within transcript $transcript_id. Skipping."
-                full_cds = nothing
-                break
+                valid = false; break
             end
             seq_frag = genome[record_id][GFF3.seqrange(frag)]
             if strand == '-'
@@ -176,27 +150,13 @@ function reconstruct_cds_from_gff3(gff3_file::String, genome::Dict{String, LongD
             append!(full_cds, seq_frag)
         end
 
-        if full_cds !== nothing && length(full_cds) > 0
+        if valid && length(full_cds) > 0
             # Determine the 3' boundary (genomic coordinate)
-            # If +, the boundary is the highest coordinate (seqend).
-            # If -, the boundary is the lowest coordinate (seqstart).
-            
-            # We need the min/max across all fragments, regardless of the sorting order used for reconstruction.
-            if strand == '+'
-                 boundary = maximum(GFF3.seqend.(fragments))
-            else
-                 boundary = minimum(GFF3.seqstart.(fragments))
-            end
+            boundary = (strand == '+') ? maximum(GFF3.seqend.(fragments)) : minimum(GFF3.seqstart.(fragments))
 
-            reconstructed_cds[transcript_id] = Dict(
-                :sequence => full_cds,
-                :record_id => record_id,
-                :strand => strand,
-                :boundary => boundary
-            )
+            reconstructed_cds[transcript_id] = Dict(:sequence => full_cds, :record_id => record_id, :strand => strand, :boundary => boundary)
         end
     end
-
     return reconstructed_cds
 end
 
@@ -209,15 +169,10 @@ Analyzes reconstructed CDS sequences to find those containing in-frame TGA codon
 """
 function find_annotation_candidates(reconstructed_cds::Dict{String, Dict{Symbol, Any}})
     candidates = Dict{String, SelenoCandidate}()
-
     for (transcript_id, data) in reconstructed_cds
         cds_seq = data[:sequence]
-        # Check for in-frame TGA (UGA)
-
-        # We check internal codons. We exclude the first codon (start) and the last codon (annotated stop).
-        # Check from the second codon (index 4) up to the penultimate codon (length - 3).
         has_internal_tga = false
-        # Ensure sequence is long enough (Start + Internal + Stop = 9bp)
+        # Check internal codons (exclude start and annotated stop).
         if length(cds_seq) >= 9
             for i in 4:3:length(cds_seq)-3
                 if cds_seq[i:i+2] == dna"TGA"
@@ -229,19 +184,10 @@ function find_annotation_candidates(reconstructed_cds::Dict{String, Dict{Symbol,
 
         if has_internal_tga
             candidate_id = "Annot_" * transcript_id
-            candidate = SelenoCandidate(
-                candidate_id,
-                "Annotation",
-                data[:record_id],
-                data[:strand],
-                data[:boundary],
-                seq=cds_seq,
-                uga=true
-            )
+            candidate = SelenoCandidate(candidate_id, "Annotation", data[:record_id], data[:strand], data[:boundary], seq=cds_seq, uga=true)
             candidates[candidate_id] = candidate
         end
     end
-
     return candidates
 end
 
@@ -250,204 +196,105 @@ end
 # ----------------------------------------------------------------------------
 
 """
-Uses TBLASTN to find regions in the genome homologous to known selenoproteins,
-and verifies the Sec (U) alignment to a Stop codon (*).
+Uses TBLASTN to find regions homologous to known selenoproteins, verifying the U-* alignment.
 """
 function find_homology_candidates(genome_fasta::String, config::PipelineConfig)
     candidates = Dict{String, SelenoCandidate}()
     @info "Running TBLASTN (this may take some time)..."
 
-    TBLASTN_EXEC = config.tblastn_exec
-    SELENOPROTEIN_FASTA = config.selenoprotein_fasta
-    TBLASTN_EVALUE_CUTOFF = config.tblastn_evalue_cutoff
-    CPU_CORES = config.cpu_cores
+    # Run TBLASTN
+    cmd = `$(config.tblastn_exec) -query $(config.selenoprotein_fasta) -subject $genome_fasta -evalue $(config.tblastn_evalue_cutoff) -num_threads $(config.cpu_cores) -outfmt "6 std qseq sseq"`
 
-    # Added num_threads parameter for TBLASTN
-    cmd = `$TBLASTN_EXEC -query $SELENOPROTEIN_FASTA -subject $genome_fasta -evalue $TBLASTN_EVALUE_CUTOFF -num_threads $CPU_CORES -outfmt "6 std qseq sseq"`
+    output = try read(cmd, String) catch e; @error "Error executing TBLASTN: $e"; return candidates end
+    if isempty(output) return candidates end
 
-    output = try
-        read(cmd, String)
-    catch e
-        @error "Error executing TBLASTN: $e. Ensure BLAST+ is installed and configured correctly."
-        return candidates
-    end
-
-    if isempty(output)
-        @info "No TBLASTN hits found."
-        return candidates
-    end
-
-    # Parse the output using CSV.jl
+    # Parse output
     blast_cols = [:qseqid, :sseqid, :pident, :length, :mismatch, :gapopen, :qstart, :qend, :sstart, :send, :evalue, :bitscore, :qseq, :sseq]
-    # Use IOBuffer to treat the string output as a file
-    df = try
-        CSV.File(IOBuffer(output), header=blast_cols, delim='\t') |> DataFrame
-    catch e
-        @error "Error parsing TBLASTN output: $e"
-        return candidates
+    df = try CSV.File(IOBuffer(output), header=blast_cols, delim='\t') |> DataFrame catch e; @error "Error parsing TBLASTN output: $e"; return candidates end
+
+    # CRITICAL: Verify U-* alignment signature
+    df[!, :has_sec_signature] = map(df.qseq, df.sseq) do qseq, sseq
+        any(q_char == 'U' && s_char == '*' for (q_char, s_char) in zip(qseq, sseq))
     end
-
-    # CRITICAL STEP: Verify the U-* alignment signature
-    df[!, :has_sec_signature] = falses(nrow(df))
-
-    for i in 1:nrow(df)
-        qseq = df[i, :qseq]
-        sseq = df[i, :sseq]
-        # Iterate through the aligned sequences
-        for (q_char, s_char) in zip(qseq, sseq)
-            # Check if Selenocysteine (U) in the query aligns with a Stop codon (*) in the subject
-            if q_char == 'U' && s_char == '*'
-                df[i, :has_sec_signature] = true
-                break
-            end
-        end
-    end
-
-    # Filter out hits that lack the signature (e.g., Cys-homologs that don't align U to *)
     df = filter(:has_sec_signature => identity, df)
 
-    if nrow(df) == 0
-        @info "No TBLASTN hits found with the U-* alignment signature."
-        return candidates
-    end
+    if nrow(df) == 0 return candidates end
+    @info "Found $(nrow(df)) hits with U-* signature. Clustering hits..."
 
-    @info "Found $(nrow(df)) hits with U-* alignment signature. Clustering hits..."
-    
-    # Determine strand for each HSP first
-    df[!, :strand] = map(df.sstart, df.send) do sstart, send
-        (sstart < send) ? '+' : '-'
-    end
+    df[!, :strand] = map(df.sstart, df.send) do s, e; (s < e) ? '+' : '-' end
 
-    # Group by Query (qseqid), Subject (sseqid), and Strand to handle overlapping genes on opposite strands.
-    grouped = groupby(df, [:qseqid, :sseqid, :strand])
-
-    for group in grouped
+    # Group hits (HSPs) by Query, Subject, and Strand
+    for group in groupby(df, [:qseqid, :sseqid, :strand])
         strand = group[1, :strand]
-
-        # Find the most downstream coordinate across all HSPs in the group (the 3' boundary)
-        if strand == '+'
-            # Maximum coordinate value
-            boundary = maximum(max.(group[!, :sstart], group[!, :send]))
-        else
-            # Minimum coordinate value
-            boundary = minimum(min.(group[!, :sstart], group[!, :send]))
-        end
-
+        boundary = (strand == '+') ? maximum(max.(group[!, :sstart], group[!, :send])) : minimum(min.(group[!, :sstart], group[!, :send]))
         record_id = group[1, :sseqid]
-        # Create a unique ID for this homology cluster, including strand
         candidate_id = "Homol_" * group[1, :qseqid] * "_on_" * record_id * "_" * string(boundary) * strand
-
-        # Homology is true by definition, UGA is true because we checked the U-* signature.
-        candidate = SelenoCandidate(candidate_id, "Homology", record_id, strand, boundary, homology=true, uga=true)
-        candidates[candidate_id] = candidate
+        
+        candidates[candidate_id] = SelenoCandidate(candidate_id, "Homology", record_id, strand, boundary, homology=true, uga=true)
     end
-
     return candidates
 end
 
 # ----------------------------------------------------------------------------
-# 4. Unified SECIS Element Prediction (Efficient Batch Processing)
+# 4. Unified SECIS Element Prediction
 # ----------------------------------------------------------------------------
 
 """
-Extracts putative 3' UTRs for all candidates, writes them to a single FASTA file,
-and runs Infernal's cmsearch efficiently on the batch.
+Extracts putative 3' UTRs and runs Infernal's cmsearch efficiently on the batch.
 """
 function predict_secis(candidates::Dict{String, SelenoCandidate}, genome::Dict{String, LongDNA{4}}, config::PipelineConfig)
     if isempty(candidates) return end
 
-    MAX_3UTR_SEARCH = config.max_3utr_search
-
-    # 1. Extract 3' UTR sequences
     utr_sequences = Dict{String, LongDNA{4}}()
+    MAX_3UTR_SEARCH = config.max_3utr_search
 
     for (id, candidate) in candidates
         if !haskey(genome, candidate.record_id) continue end
         record_seq = genome[candidate.record_id]
 
-        # Determine 3' UTR coordinates based on strand and boundary
         if candidate.strand == '+'
             start_pos = candidate.cds_boundary + 1
             end_pos = min(length(record_seq), start_pos + MAX_3UTR_SEARCH - 1)
         elseif candidate.strand == '-'
-            # Reverse strand: 3' UTR is genomically *before* the boundary
             end_pos = candidate.cds_boundary - 1
             start_pos = max(1, end_pos - MAX_3UTR_SEARCH + 1)
-        else
-            continue
-        end
+        else continue end
 
-        # Check boundary conditions
-        if start_pos >= end_pos || start_pos < 1 || end_pos > length(record_seq)
-            continue
-        end
+        if start_pos >= end_pos || start_pos < 1 || end_pos > length(record_seq) continue end
 
-        # Extract and orient sequence (must be 5'->3' for RNA search)
         putative_3utr = record_seq[start_pos:end_pos]
         if candidate.strand == '-'
             putative_3utr = reverse_complement(putative_3utr)
         end
-
         utr_sequences[id] = putative_3utr
     end
 
-    if isempty(utr_sequences)
-        @info "No valid 3' UTR sequences extracted for SECIS prediction."
-        return
-    end
+    if isempty(utr_sequences) return end
 
-    # 2. Use mktempdir for safe temporary file handling
     mktempdir() do tmp_dir
         tmp_fasta = joinpath(tmp_dir, "utrs.fasta")
-        try
-            open(FASTA.Writer, tmp_fasta) do writer
-                for (id, seq) in utr_sequences
-                    write(writer, FASTA.Record(id, seq))
-                end
+        open(FASTA.Writer, tmp_fasta) do writer
+            for (id, seq) in utr_sequences
+                write(writer, FASTA.Record(id, seq))
             end
+        end
 
-            # 3. Run cmsearch on the batch
-            @info "Running Infernal (cmsearch) on $(length(utr_sequences)) sequences..."
+        @info "Running Infernal (cmsearch) on $(length(utr_sequences)) sequences..."
+        tmp_tblout = joinpath(tmp_dir, "cmsearch.tblout")
+        cmd = `$(config.cmsearch_exec) --cpu $(config.cpu_cores) --tblout $tmp_tblout -E $(config.cmsearch_evalue_cutoff) $(config.secis_cm_file) $tmp_fasta`
 
-            CMSEARCH_EXEC = config.cmsearch_exec
-            CPU_CORES = config.cpu_cores
-            CMSEARCH_EVALUE_CUTOFF = config.cmsearch_evalue_cutoff
-            SECIS_CM_FILE = config.secis_cm_file
+        try run(pipeline(cmd, stdout=devnull, stderr=stderr)) catch e; @error "Error executing cmsearch: $e"; return end
 
-            # Use --tblout to get structured, parsable results
-            tmp_tblout = joinpath(tmp_dir, "cmsearch.tblout")
-            cmd = `$CMSEARCH_EXEC --cpu $CPU_CORES --tblout $tmp_tblout -E $CMSEARCH_EVALUE_CUTOFF $SECIS_CM_FILE $tmp_fasta`
-
-            try
-                # Redirect stdout to devnull to keep the console clean, but keep stderr
-                run(pipeline(cmd, stdout=devnull, stderr=stderr))
-            catch e
-                @error "Error executing cmsearch: $e. Ensure Infernal is installed and configured correctly."
-                return
-            end
-
-            # 4. Parse the results (tblout format)
-            if isfile(tmp_tblout)
-                hits = readlines(tmp_tblout)
-                for line in hits
-                    if !startswith(line, "#")
-                        # Columns are space-separated. We use regex split to handle variable whitespace in tblout
-                        parts = split(line, r"\s+")
-                        if length(parts) >= 1
-                            candidate_id = parts[1]
-                            if haskey(candidates, candidate_id)
-                                # Update the candidate status
-                                candidates[candidate_id].has_secis = true
-                            end
-                        end
+        if isfile(tmp_tblout)
+            for line in readlines(tmp_tblout)
+                if !startswith(line, "#")
+                    parts = split(line, r"\s+")
+                    if !isempty(parts) && haskey(candidates, parts[1])
+                        candidates[parts[1]].has_secis = true
                     end
                 end
             end
-
-        catch e
-            @error "An error occurred during SECIS prediction: $e"
         end
-        # Temp files are automatically cleaned up by mktempdir
     end
 end
 
@@ -456,149 +303,80 @@ end
 # ----------------------------------------------------------------------------
 
 """
-Confirms homology for annotation-based candidates using BLASTP (Efficient Batch Processing).
+Confirms homology for annotation-based candidates using BLASTP.
 """
 function confirm_homology_blastp(candidates::Dict{String, SelenoCandidate}, config::PipelineConfig)
-    # Filter for annotation-based candidates that passed the SECIS filter and need confirmation
     to_confirm = filter(p -> p.second.source == "Annotation" && p.second.has_secis && p.second.cds_sequence !== nothing, candidates)
-
     if isempty(to_confirm) return end
 
     @info "Running BLASTP confirmation for $(length(to_confirm)) annotation-based candidates..."
-
-    # Use mktempdir for safer temporary file handling
     mktempdir() do tmp_dir
         tmp_fasta = joinpath(tmp_dir, "candidates.faa")
-        try
-            sequences_written = 0
-            open(FASTA.Writer, tmp_fasta) do writer
-                for (id, candidate) in to_confirm
-                    # Basic validation: ensure the sequence length is a multiple of 3
-                    if length(candidate.cds_sequence) % 3 != 0
-                        @warn "Candidate $id CDS length is not a multiple of 3. Skipping translation."
-                        continue
-                    end
-                    # Translate the DNA sequence (assuming standard genetic code)
-                    protein_seq = try
-                         translate(candidate.cds_sequence, code=standard_genetic_code)
-                    catch e
-                        @warn "Error during translation of candidate $id: $e. Skipping."
-                        continue
-                    end
-
-                    # Crucial Step: Replace stop codons '*' (AA_Term) with 'U' (AA_U, Selenocysteine)
-                    protein_seq_u = replace(protein_seq, AA_Term => AA_U)
-                    
-                    # Remove the final annotated stop codon if it exists (represented as U after replacement)
-                    if !isempty(protein_seq_u) && protein_seq_u[end] == AA_U
-                       # If the translation resulted in a terminal AA_U, it means the last codon was the annotated stop codon.
-                       protein_seq_u = protein_seq_u[1:end-1]
-                    end
-                    
-                    if !isempty(protein_seq_u)
-                        write(writer, FASTA.Record(id, protein_seq_u))
-                        sequences_written += 1
-                    end
+        sequences_written = 0
+        open(FASTA.Writer, tmp_fasta) do writer
+            for (id, candidate) in to_confirm
+                if length(candidate.cds_sequence) % 3 != 0 continue end
+                
+                protein_seq = try translate(candidate.cds_sequence, code=standard_genetic_code) catch e; @warn "Translation failed for $id: $e"; continue end
+                
+                # Crucial: Replace stop codons '*' (AA_Term) with 'U' (AA_U)
+                protein_seq_u = replace(protein_seq, AA_Term => AA_U)
+                
+                # Remove the final annotated stop codon if present (now a U)
+                if !isempty(protein_seq_u) && protein_seq_u[end] == AA_U
+                   protein_seq_u = protein_seq_u[1:end-1]
+                end
+                
+                if !isempty(protein_seq_u)
+                    write(writer, FASTA.Record(id, protein_seq_u))
+                    sequences_written += 1
                 end
             end
-
-            if sequences_written == 0
-                @info "No valid sequences available for BLASTP confirmation."
-                return
-            end
-
-            # Run blastp on the batch
-            BLASTP_EXEC = config.blastp_exec
-            SELENOPROTEIN_BLAST_DB = config.selenoprotein_blast_db
-            BLASTP_EVALUE_CUTOFF = config.blastp_evalue_cutoff
-            CPU_CORES = config.cpu_cores
-
-            # Added num_threads parameter for BLASTP
-            cmd = `$BLASTP_EXEC -query $tmp_fasta -db $SELENOPROTEIN_BLAST_DB -evalue $BLASTP_EVALUE_CUTOFF -num_threads $CPU_CORES -outfmt 6`
-            
-            output = try
-                read(cmd, String)
-            catch e
-                 @error "Error executing BLASTp: $e. Ensure BLAST+ is installed and the database ($SELENOPROTEIN_BLAST_DB) is correctly formatted."
-                 return
-            end
-
-            if !isempty(output)
-                # Parse results to see which IDs had hits
-                lines = split(output, '\n')
-                for line in lines
-                    if !isempty(line)
-                        parts = split(line, '\t')
-                        if length(parts) >= 1
-                            hit_id = parts[1]
-                            if haskey(candidates, hit_id)
-                                candidates[hit_id].has_homology = true
-                            end
-                        end
-                    end
-                end
-            end
-
-        catch e
-            @error "An unexpected error occurred during BLASTP confirmation: $e"
         end
-        # Temp files are automatically cleaned up by mktempdir
+
+        if sequences_written == 0 return end
+
+        cmd = `$(config.blastp_exec) -query $tmp_fasta -db $(config.selenoprotein_blast_db) -evalue $(config.blastp_evalue_cutoff) -num_threads $(config.cpu_cores) -outfmt 6`
+        
+        output = try read(cmd, String) catch e; @error "Error executing BLASTp: $e"; return end
+
+        if !isempty(output)
+            for line in split(output, '\n')
+                if !isempty(line)
+                    parts = split(line, '\t')
+                    if !isempty(parts) && haskey(candidates, parts[1])
+                        candidates[parts[1]].has_homology = true
+                    end
+                end
+            end
+        end
     end
 end
 
 function generate_report(candidates::Dict{String, SelenoCandidate}, config::PipelineConfig)
     @info "Generating report..."
-
-    # Run BLASTP confirmation step
     confirm_homology_blastp(candidates, config)
     
-    # Convert results to a DataFrame for easy viewing and saving
-    results_df = DataFrame(
-        ID = String[],
-        Source = String[],
-        Record_ID = String[],
-        Strand = Char[],
-        CDS_Boundary_Coord = Int[],
-        Has_SECIS = Bool[],
-        Has_Homology = Bool[],
-        In_Frame_UGA = Bool[]
-    )
+    results_df = DataFrame(ID = String[], Source = String[], Record_ID = String[], Strand = Char[], CDS_Boundary_Coord = Int[], Has_SECIS = Bool[], Has_Homology = Bool[], In_Frame_UGA = Bool[])
 
-    # Sort candidates by ID for reproducible results
-    sorted_candidate_ids = sort(collect(keys(candidates)))
-
-    for id in sorted_candidate_ids
+    for id in sort(collect(keys(candidates)))
         hit = candidates[id]
-        push!(results_df, (
-            hit.id,
-            hit.source,
-            hit.record_id,
-            hit.strand,
-            hit.cds_boundary,
-            hit.has_secis,
-            hit.has_homology,
-            hit.in_frame_uga
-        ))
+        push!(results_df, (hit.id, hit.source, hit.record_id, hit.strand, hit.cds_boundary, hit.has_secis, hit.has_homology, hit.in_frame_uga))
     end
 
-    # Filter for high confidence hits: SECIS + Homology + UGA
     high_confidence_df = filter(row -> row.Has_SECIS && row.Has_Homology && row.In_Frame_UGA, results_df)
 
-    println("\n--- CelenoC Pipeline Report ---")
+    println("\n--- CelenoC Prediction Report ---")
     if isempty(high_confidence_df)
         println("No high-confidence selenoprotein candidates identified.")
     else
         println("High-confidence candidates found: $(nrow(high_confidence_df))\n")
-        # Display a summarized view
         show(high_confidence_df[!, [:ID, :Source, :Record_ID, :Strand, :CDS_Boundary_Coord]], allrows=true)
     end
-    
-    println("\nNOTE: All candidates require manual verification of the sequence alignments and gene models.")
+    println("\nNOTE: Manual verification of alignments and gene models is required.")
     println("-----------------------------------\n")
-
     return results_df
 end
-
 
 # ----------------------------------------------------------------------------
 # 6. Main Pipeline Orchestration
@@ -607,7 +385,12 @@ end
 """
     predict_selenoproteins(genome_fasta::String, annotations_gff3::String=""; kwargs...)
 
-Runs the comprehensive selenoprotein identification pipeline.
+Runs the comprehensive de novo selenoprotein identification pipeline.
+
+This pipeline identifies candidates based on three key pieces of evidence:
+1.  An in-frame UGA (TGA) codon, found either via annotation or homology.
+2.  A downstream SECIS RNA element in the 3' UTR.
+3.  Homology to a known selenoprotein family.
 
 # Arguments
 - `genome_fasta`: Path to the genome sequence file (FASTA format).
@@ -629,11 +412,11 @@ Runs the comprehensive selenoprotein identification pipeline.
 function predict_selenoproteins(
     genome_fasta::String,
     annotations_gff3::String="";
-    # External Tools (Defaults assume they are in PATH)
+    # External Tools
     cmsearch_exec="cmsearch",
     blastp_exec="blastp",
     tblastn_exec="tblastn",
-    # Required Resources (Must be provided)
+    # Required Resources
     secis_cm_file=nothing,
     selenoprotein_fasta=nothing,
     selenoprotein_blast_db=nothing,
@@ -645,11 +428,11 @@ function predict_selenoproteins(
     cpu_cores=4
     )
 
-    @info "Starting CelenoC Selenoprotein Identification Pipeline..."
+    @info "Starting CelenoC Selenoprotein Prediction Pipeline..."
 
-    # 1. Validate Configuration
+    # 1. Validation
     if secis_cm_file === nothing || selenoprotein_fasta === nothing || selenoprotein_blast_db === nothing
-        @error "Missing required resources: secis_cm_file, selenoprotein_fasta, and selenoprotein_blast_db must be provided as keyword arguments."
+        @error "Missing required resources: secis_cm_file, selenoprotein_fasta, and selenoprotein_blast_db must be provided."
         return nothing
     end
 
@@ -660,7 +443,7 @@ function predict_selenoproteins(
     )
 
     if !check_executables(config) || !check_resources(config)
-        @error "Configuration validation failed. Please check paths to executables and resource files."
+        @error "Configuration validation failed. Check paths to executables and resource files."
         return nothing
     end
 
@@ -669,49 +452,40 @@ function predict_selenoproteins(
         @error "Genome FASTA file not found: $genome_fasta"
         return nothing
     end
-    
     @info "Loading genome..."
     genome = load_genome(genome_fasta)
-    @info "Loaded genome with $(length(genome)) sequences."
 
-    # 3. Initialize Candidates Dict
+    # 3. Initialize Candidates
     all_candidates = Dict{String, SelenoCandidate}()
 
     # 4. Annotation-Based Search
     if !isempty(annotations_gff3) && isfile(annotations_gff3)
         @info "Starting Annotation-Based Search..."
-        # Preprocess GFF3 to handle splicing
         reconstructed_cds = reconstruct_cds_from_gff3(annotations_gff3, genome)
-        @info "Reconstructed $(length(reconstructed_cds)) CDS sequences from annotations."
-        
         anno_candidates = find_annotation_candidates(reconstructed_cds)
         merge!(all_candidates, anno_candidates)
-        @info "Found $(length(anno_candidates)) candidates with internal TGA codons."
+        @info "Found $(length(anno_candidates)) candidates via annotation analysis."
     else
-        @info "Skipping Annotation-Based Search (No valid GFF3 provided)."
+        @info "Skipping Annotation-Based Search (No GFF3 provided)."
     end
 
     # 5. Homology-Based Search
     @info "Starting Homology-Based Search..."
     homol_candidates = find_homology_candidates(genome_fasta, config)
-    # Merge results
     merge!(all_candidates, homol_candidates)
-    @info "Found $(length(homol_candidates)) unique candidate regions via homology search (TBLASTN)."
+    @info "Found $(length(homol_candidates)) candidates via homology search."
 
     if isempty(all_candidates)
-        @warn "No initial candidates found (neither annotation nor homology). Exiting."
+        @warn "No initial candidates found. Exiting."
         return nothing
     end
 
     # 6. Unified SECIS Prediction
     @info "Starting SECIS element prediction for $(length(all_candidates)) candidates..."
     predict_secis(all_candidates, genome, config)
-    secis_count = count(p -> p.second.has_secis, all_candidates)
-    @info "Found SECIS elements for $secis_count candidates."
 
     # 7. Reporting and Final Confirmation
     results_df = generate_report(all_candidates, config)
-
     @info "Pipeline finished."
     return results_df
 end
