@@ -1,5 +1,7 @@
 # Selenoprotein identification pipeline
 
+## not currently maintained nor responding to issues. 
+
 A hybrid pipeline implemented in Julia for identifying eukaryotic selenocysteine-containing proteins (selenoproteins) in genomic datasets. It combines annotation-based analysis with *de novo* homology-based searching.
 
 ## Table of Contents
